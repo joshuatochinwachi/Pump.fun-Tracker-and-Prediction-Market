@@ -1,0 +1,10 @@
+query_id,data,last_updated,status
+5508970,"token_tier,wallets
+<1K PUMP,59523
+1K - 10K PUMP,24943
+10K - 100K PUMP,16610
+100K - 1M PUMP,7253
+1M - 10M PUMP,2224
+10M - 100M PUMP,581
+100M+ PUMP,237
+",2025-11-21T17:30:34.721102,success
