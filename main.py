@@ -195,6 +195,56 @@ class CacheManager:
             logger.error(f"Failed to fetch CoinGecko data: {e}")
             return {}
     
+    async def fetch_coingecko_history(self, days: int = 30) -> pd.DataFrame:
+        """Fetch hourly historical prices for Pump.fun token from CoinGecko Pro API"""
+        
+        # Check cache first
+        cache_key = f'coingecko_pump_history_{days}d'
+        cached = self.get_cached_data(cache_key)
+        if cached is not None:
+            logger.info(f"Using cached data for {cache_key}")
+            return cached
+        
+        try:
+            async with aiohttp.ClientSession(headers=self.session_headers) as session:
+                url = "https://pro-api.coingecko.com/api/v3/coins/pump-fun/market_chart"
+                params = {
+                    "vs_currency": "usd",
+                    "days": days
+                    # Note: interval is automatic - hourly for 2-90 days, daily for >90 days
+                }
+                
+                logger.info(f"Fetching {days} days of hourly price data for Pump.fun...")
+                
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    
+                    # Extract prices, market caps, and volumes
+                    prices = data.get('prices', [])
+                    market_caps = data.get('market_caps', [])
+                    volumes = data.get('total_volumes', [])
+                    
+                    # Convert to DataFrame EXACTLY as in the original code
+                    df = pd.DataFrame({
+                        'timestamp': [datetime.fromtimestamp(p[0]/1000) for p in prices],
+                        'price_usd': [p[1] for p in prices],
+                        'market_cap': [m[1] for m in market_caps],
+                        'volume_24h': [v[1] for v in volumes]
+                    })
+                    
+                    # Cache the result
+                    self.cache_data(cache_key, df)
+                    
+                    logger.info(f"Successfully fetched {len(df)} hourly data points")
+                    logger.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+                    
+                    return df
+                    
+        except Exception as e:
+            logger.error(f"Failed to fetch CoinGecko historical data: {e}")
+            return pd.DataFrame()
+    
     async def fetch_dune_raw(self, query_key: str) -> pd.DataFrame:
         """Fetch raw Dune data - NO MANIPULATION"""
         
@@ -278,6 +328,10 @@ async def refresh_all_data_background():
             if coingecko_data:
                 cache_manager.cache_data('coingecko_pump', pd.DataFrame([coingecko_data]))
             
+            # Refresh CoinGecko historical data (30 days default)
+            history_df = await cache_manager.fetch_coingecko_history(days=30)
+            # No need to cache again - already cached in fetch_coingecko_history
+            
             # Refresh all Dune queries
             for query_key in config.dune_queries.keys():
                 await cache_manager.fetch_dune_raw(query_key)
@@ -339,7 +393,8 @@ async def root(request: Request):
         "cache_info": f"{base_url}/api/cache/status",
         "endpoints": {
             "coingecko": {
-                "pump_market_data": "/api/raw/coingecko/pump"
+                "pump_market_data": "/api/raw/coingecko/pump",
+                "pump_hourly_prices": "/api/raw/coingecko/pump/history?days=30"
             },
             "pump_fun_launchpad": {
                 "lifetime_revenue": "/api/raw/dune/lifetime_revenue",
@@ -381,9 +436,9 @@ async def root(request: Request):
                 "clear_cache": "/api/cache/clear"
             }
         },
-        "total_data_sources": 29,
+        "total_data_sources": 30,
         "cache_duration": "6 hours",
-        "note": "All endpoints return RAW data exactly as received from APIs"
+        "note": "All endpoints return RAW data exactly as received from APIs. Historical price data supports 2-90 days (hourly) or >90 days (daily) granularity."
     }
 
 @app.get("/health")
@@ -437,6 +492,54 @@ async def get_coingecko_pump_data():
         
     except Exception as e:
         logger.error(f"Error in CoinGecko endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/raw/coingecko/pump/history", response_model=CachedDataResponse)
+async def get_coingecko_pump_history(days: int = Query(default=30, ge=1, le=365, description="Number of days of historical data (1-365)")):
+    """
+    Get hourly historical prices for Pump.fun token ($PUMP)
+    
+    Returns DataFrame with:
+    - timestamp: DateTime of the data point
+    - price_usd: Price in USD
+    - market_cap: Market capitalization
+    - volume_24h: 24-hour trading volume
+    
+    Granularity:
+    - 2-90 days: Hourly data
+    - >90 days: Daily data
+    
+    Parameters:
+    - days: Number of days of historical data to fetch (default: 30, min: 1, max: 365)
+    """
+    try:
+        # Fetch historical data
+        df = await cache_manager.fetch_coingecko_history(days=days)
+        
+        if df.empty:
+            raise HTTPException(
+                status_code=503,
+                detail="Failed to fetch CoinGecko historical data"
+            )
+        
+        # Convert DataFrame to list of dicts
+        data = df.to_dict('records')
+        
+        # Generate metadata
+        cache_key = f'coingecko_pump_history_{days}d'
+        metadata = cache_manager.get_metadata_for_key(
+            cache_key,
+            source='CoinGecko Pro API - Market Chart',
+            row_count=len(data)
+        )
+        
+        return CachedDataResponse(
+            metadata=metadata,
+            data=data
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in CoinGecko history endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==================== DUNE ENDPOINTS (28 queries) ====================
@@ -531,7 +634,7 @@ async def get_cache_status():
         status = {
             "cache_directory": cache_manager.cache_dir,
             "cache_duration_hours": 6,
-            "total_sources": 29,
+            "total_sources": 30,
             "sources": {}
         }
         
@@ -543,6 +646,17 @@ async def get_cache_status():
             "is_cached": cg_age != float('inf'),
             "is_fresh": cg_age < 6 if cg_age != float('inf') else False,
             "last_updated": cache_manager.metadata.get('coingecko_pump', {}).get('last_updated', 'Never')
+        }
+        
+        # CoinGecko history status (30 days default)
+        cg_history_age = cache_manager._get_cache_age('coingecko_pump_history_30d')
+        status['sources']['coingecko_pump_history_30d'] = {
+            "type": "CoinGecko - Historical Prices",
+            "cache_age_hours": round(cg_history_age, 2) if cg_history_age != float('inf') else None,
+            "is_cached": cg_history_age != float('inf'),
+            "is_fresh": cg_history_age < 6 if cg_history_age != float('inf') else False,
+            "last_updated": cache_manager.metadata.get('coingecko_pump_history_30d', {}).get('last_updated', 'Never'),
+            "row_count": cache_manager.metadata.get('coingecko_pump_history_30d', {}).get('row_count', 0)
         }
         
         # Dune queries status
@@ -588,6 +702,17 @@ async def force_refresh_all():
         except Exception as e:
             logger.error(f"CoinGecko refresh failed: {e}")
             refresh_results['results']['coingecko'] = f"error: {str(e)}"
+        
+        # Refresh CoinGecko historical data
+        try:
+            history_df = await cache_manager.fetch_coingecko_history(days=30)
+            if not history_df.empty:
+                refresh_results['results']['coingecko_history'] = f"success ({len(history_df)} rows)"
+            else:
+                refresh_results['results']['coingecko_history'] = "no data"
+        except Exception as e:
+            logger.error(f"CoinGecko history refresh failed: {e}")
+            refresh_results['results']['coingecko_history'] = f"error: {str(e)}"
         
         # Refresh all Dune queries
         for query_key in config.dune_queries.keys():
@@ -641,7 +766,7 @@ async def clear_cache():
 @app.get("/api/bulk/all")
 async def get_all_data():
     """
-    Get all data sources at once (CoinGecko + all 28 Dune queries)
+    Get all data sources at once (2 CoinGecko endpoints + all 28 Dune queries)
     Useful for dashboard initialization
     """
     try:
@@ -665,6 +790,17 @@ async def get_all_data():
         except Exception as e:
             logger.error(f"Error fetching CoinGecko in bulk: {e}")
             result['coingecko']['pump'] = {"error": str(e)}
+        
+        # Get CoinGecko historical data
+        try:
+            cg_history_response = await get_coingecko_pump_history(days=30)
+            result['coingecko']['pump_history'] = {
+                "metadata": cg_history_response.metadata.dict(),
+                "data": cg_history_response.data
+            }
+        except Exception as e:
+            logger.error(f"Error fetching CoinGecko history in bulk: {e}")
+            result['coingecko']['pump_history'] = {"error": str(e)}
         
         # Define category mappings
         launchpad_queries = [
